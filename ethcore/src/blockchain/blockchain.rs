@@ -25,11 +25,11 @@ use heapsize::HeapSizeOf;
 use ethereum_types::{H256, Bloom, U256};
 use parking_lot::{Mutex, RwLock};
 use bytes::Bytes;
-use rlp::{Rlp, RlpStream};
+use rlp::RlpStream;
 use rlp_compress::{compress, decompress, blocks_swapper};
 use header::*;
 use transaction::*;
-use views::*;
+use views::{BlockView, HeaderView};
 use log_entry::{LogEntry, LocalizedLogEntry};
 use receipt::Receipt;
 use blooms::{BloomGroup, GroupPosition};
@@ -56,6 +56,12 @@ pub trait BlockProvider {
 	/// Returns true if the given block is known
 	/// (though not necessarily a part of the canon chain).
 	fn is_known(&self, hash: &H256) -> bool;
+
+	/// Returns true if the given block is known and in the canon chain.
+	fn is_canon(&self, hash: &H256) -> bool {
+		let is_canon = || Some(hash == &self.block_hash(self.block_number(hash)?)?);
+		is_canon().unwrap_or(false)
+	}
 
 	/// Get the first block of the best part of the chain.
 	/// Return `None` if there is no gap and the first block is the genesis.
@@ -148,7 +154,7 @@ pub trait BlockProvider {
 	fn blocks_with_bloom(&self, bloom: &Bloom, from_block: BlockNumber, to_block: BlockNumber) -> Vec<BlockNumber>;
 
 	/// Returns logs matching given filter.
-	fn logs<F>(&self, blocks: Vec<BlockNumber>, matches: F, limit: Option<usize>) -> Vec<LocalizedLogEntry>
+	fn logs<F>(&self, blocks: Vec<H256>, matches: F, limit: Option<usize>) -> Vec<LocalizedLogEntry>
 		where F: Fn(&LogEntry) -> bool + Send + Sync, Self: Sized;
 }
 
@@ -231,13 +237,7 @@ impl BlockProvider for BlockChain {
 	fn block(&self, hash: &H256) -> Option<encoded::Block> {
 		let header = self.block_header_data(hash)?;
 		let body = self.block_body(hash)?;
-
-		let mut block = RlpStream::new_list(3);
-		let body_rlp = body.rlp();
-		block.append_raw(header.rlp().as_raw(), 1);
-		block.append_raw(body_rlp.at(0).as_raw(), 1);
-		block.append_raw(body_rlp.at(1).as_raw(), 1);
-		Some(encoded::Block::new(block.out()))
+		Some(encoded::Block::new_from_header_and_body(&header.view(), &body.view()))
 	}
 
 	/// Get block header data
@@ -338,16 +338,18 @@ impl BlockProvider for BlockChain {
 			.collect()
 	}
 
-	fn logs<F>(&self, mut blocks: Vec<BlockNumber>, matches: F, limit: Option<usize>) -> Vec<LocalizedLogEntry>
+	/// Returns logs matching given filter. The order of logs returned will be the same as the order of the blocks
+	/// provided. And it's the callers responsibility to sort blocks provided in advance.
+	fn logs<F>(&self, mut blocks: Vec<H256>, matches: F, limit: Option<usize>) -> Vec<LocalizedLogEntry>
 		where F: Fn(&LogEntry) -> bool + Send + Sync, Self: Sized {
 		// sort in reverse order
-		blocks.sort_by(|a, b| b.cmp(a));
+		blocks.reverse();
 
 		let mut logs = blocks
 			.chunks(128)
 			.flat_map(move |blocks_chunk| {
 				blocks_chunk.into_par_iter()
-					.filter_map(|number| self.block_hash(*number).map(|hash| (*number, hash)))
+					.filter_map(|hash| self.block_number(&hash).map(|r| (r, hash)))
 					.filter_map(|(number, hash)| self.block_receipts(&hash).map(|r| (number, hash, r.receipts)))
 					.filter_map(|(number, hash, receipts)| self.block_body(&hash).map(|ref b| (number, hash, receipts, b.transaction_hashes())))
 					.flat_map(|(number, hash, mut receipts, mut hashes)| {
@@ -374,7 +376,7 @@ impl BlockProvider for BlockChain {
 									.enumerate()
 									.map(move |(i, log)| LocalizedLogEntry {
 										entry: log,
-										block_hash: hash,
+										block_hash: *hash,
 										block_number: number,
 										transaction_hash: tx_hash,
 										// iterating in reverse order
@@ -436,7 +438,7 @@ impl<'a> Iterator for EpochTransitionIter<'a> {
 				return None
 			}
 
-			let transitions: EpochTransitions = ::rlp::decode(&val[..]);
+			let transitions: EpochTransitions = ::rlp::decode(&val[..]).expect("decode error: the db is corrupted or the data structure has changed");
 
 			// if there are multiple candidates, at most one will be on the
 			// canon chain.
@@ -460,7 +462,7 @@ impl<'a> Iterator for EpochTransitionIter<'a> {
 impl BlockChain {
 	/// Create new instance of blockchain from given Genesis.
 	pub fn new(config: Config, genesis: &[u8], db: Arc<KeyValueDB>) -> BlockChain {
-		// 400 is the avarage size of the key
+		// 400 is the average size of the key
 		let cache_man = CacheManager::new(config.pref_cache_size, config.max_cache_size, 400);
 
 		let mut bc = BlockChain {
@@ -499,7 +501,7 @@ impl BlockChain {
 			None => {
 				// best block does not exist
 				// we need to insert genesis into the cache
-				let block = BlockView::new(genesis);
+				let block = view!(BlockView, genesis);
 				let header = block.header_view();
 				let hash = block.hash();
 
@@ -701,7 +703,7 @@ impl BlockChain {
 	/// Supply a dummy parent total difficulty when the parent block may not be in the chain.
 	/// Returns true if the block is disconnected.
 	pub fn insert_unordered_block(&self, batch: &mut DBTransaction, bytes: &[u8], receipts: Vec<Receipt>, parent_td: Option<U256>, is_best: bool, is_ancient: bool) -> bool {
-		let block = BlockView::new(bytes);
+		let block = view!(BlockView, bytes);
 		let header = block.header_view();
 		let hash = header.hash();
 
@@ -898,7 +900,7 @@ impl BlockChain {
 	/// If the block is already known, does nothing.
 	pub fn insert_block(&self, batch: &mut DBTransaction, bytes: &[u8], receipts: Vec<Receipt>) -> ImportRoute {
 		// create views onto rlp
-		let block = BlockView::new(bytes);
+		let block = view!(BlockView, bytes);
 		let header = block.header_view();
 		let hash = header.hash();
 
@@ -1138,7 +1140,7 @@ impl BlockChain {
 	/// This function returns modified block hashes.
 	fn prepare_block_hashes_update(&self, block_bytes: &[u8], info: &BlockInfo) -> HashMap<BlockNumber, H256> {
 		let mut block_hashes = HashMap::new();
-		let block = BlockView::new(block_bytes);
+		let block = view!(BlockView, block_bytes);
 		let header = block.header_view();
 		let number = header.number();
 
@@ -1165,7 +1167,7 @@ impl BlockChain {
 	/// This function returns modified block details.
 	/// Uses the given parent details or attempts to load them from the database.
 	fn prepare_block_details_update(&self, block_bytes: &[u8], info: &BlockInfo) -> HashMap<H256, BlockDetails> {
-		let block = BlockView::new(block_bytes);
+		let block = view!(BlockView, block_bytes);
 		let header = block.header_view();
 		let parent_hash = header.parent_hash();
 
@@ -1197,7 +1199,7 @@ impl BlockChain {
 
 	/// This function returns modified transaction addresses.
 	fn prepare_transaction_addresses_update(&self, block_bytes: &[u8], info: &BlockInfo) -> HashMap<H256, Option<TransactionAddress>> {
-		let block = BlockView::new(block_bytes);
+		let block = view!(BlockView, block_bytes);
 		let transaction_hashes = block.transaction_hashes();
 
 		match info.location {
@@ -1265,7 +1267,7 @@ impl BlockChain {
 	/// to bloom location in database (BlocksBloomLocation).
 	///
 	fn prepare_block_blooms_update(&self, block_bytes: &[u8], info: &BlockInfo) -> HashMap<GroupPosition, BloomGroup> {
-		let block = BlockView::new(block_bytes);
+		let block = view!(BlockView, block_bytes);
 		let header = block.header_view();
 
 		let log_blooms = match info.location {
@@ -1384,9 +1386,9 @@ impl BlockChain {
 	/// Create a block body from a block.
 	pub fn block_to_body(block: &[u8]) -> Bytes {
 		let mut body = RlpStream::new_list(2);
-		let block_rlp = Rlp::new(block);
-		body.append_raw(block_rlp.at(1).as_raw(), 1);
-		body.append_raw(block_rlp.at(2).as_raw(), 1);
+		let block_view = view!(BlockView, block);
+		body.append_raw(block_view.transactions_rlp().as_raw(), 1);
+		body.append_raw(block_view.uncles_rlp().as_raw(), 1);
 		body.out()
 	}
 
@@ -1939,17 +1941,33 @@ mod tests {
 			value: 103.into(),
 			data: "601080600c6000396000f3006000355415600957005b60203560003555".from_hex().unwrap(),
 		}.sign(&secret(), None);
+		let t4 = Transaction {
+			nonce: 0.into(),
+			gas_price: 0.into(),
+			gas: 100_000.into(),
+			action: Action::Create,
+			value: 104.into(),
+			data: "601080600c6000396000f3006000355415600957005b60203560003555".from_hex().unwrap(),
+		}.sign(&secret(), None);
 		let tx_hash1 = t1.hash();
 		let tx_hash2 = t2.hash();
 		let tx_hash3 = t3.hash();
+		let tx_hash4 = t4.hash();
 
 		let genesis = BlockBuilder::genesis();
 		let b1 = genesis.add_block_with_transactions(vec![t1, t2]);
 		let b2 = b1.add_block_with_transactions(iter::once(t3));
+		let b3 = genesis.add_block_with(|| BlockOptions {
+			transactions: vec![t4.clone()],
+			difficulty: U256::from(9),
+			..Default::default()
+		}); // Branch block
 		let b1_hash = b1.last().hash();
 		let b1_number = b1.last().number();
 		let b2_hash = b2.last().hash();
 		let b2_number = b2.last().number();
+		let b3_hash = b3.last().hash();
+		let b3_number = b3.last().number();
 
 		let db = new_db();
 		let bc = new_chain(&genesis.last().encoded(), db.clone());
@@ -1980,10 +1998,21 @@ mod tests {
 				],
 			}
 		]);
+		insert_block(&db, &bc, &b3.last().encoded(), vec![
+			Receipt {
+				outcome: TransactionOutcome::StateRoot(H256::default()),
+				gas_used: 10_000.into(),
+				log_bloom: Default::default(),
+				logs: vec![
+					LogEntry { address: Default::default(), topics: vec![], data: vec![5], },
+				],
+			}
+		]);
 
 		// when
-		let logs1 = bc.logs(vec![1, 2], |_| true, None);
-		let logs2 = bc.logs(vec![1, 2], |_| true, Some(1));
+		let logs1 = bc.logs(vec![b1_hash, b2_hash], |_| true, None);
+		let logs2 = bc.logs(vec![b1_hash, b2_hash], |_| true, Some(1));
+		let logs3 = bc.logs(vec![b3_hash], |_| true, None);
 
 		// then
 		assert_eq!(logs1, vec![
@@ -2030,6 +2059,17 @@ mod tests {
 				block_hash: b2_hash,
 				block_number: b2_number,
 				transaction_hash: tx_hash3,
+				transaction_index: 0,
+				transaction_log_index: 0,
+				log_index: 0,
+			}
+		]);
+		assert_eq!(logs3, vec![
+			LocalizedLogEntry {
+				entry: LogEntry { address: Default::default(), topics: vec![], data: vec![5] },
+				block_hash: b3_hash,
+				block_number: b3_number,
+				transaction_hash: tx_hash4,
 				transaction_index: 0,
 				transaction_log_index: 0,
 				log_index: 0,

@@ -24,6 +24,7 @@ use std::cmp::{min, max};
 use std::path::{Path, PathBuf};
 use std::io::{Read, Write, self};
 use std::fs;
+use std::time::Duration;
 use ethkey::{KeyPair, Secret, Random, Generator};
 use hash::keccak;
 use mio::*;
@@ -67,13 +68,13 @@ const SYS_TIMER: TimerToken = LAST_SESSION + 1;
 
 // Timeouts
 // for IDLE TimerToken
-const MAINTENANCE_TIMEOUT: u64 = 1000;
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1);
 // for DISCOVERY_REFRESH TimerToken
-const DISCOVERY_REFRESH_TIMEOUT: u64 = 60_000;
+const DISCOVERY_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 // for DISCOVERY_ROUND TimerToken
-const DISCOVERY_ROUND_TIMEOUT: u64 = 300;
+const DISCOVERY_ROUND_TIMEOUT: Duration = Duration::from_millis(300);
 // for NODE_TABLE TimerToken
-const NODE_TABLE_TIMEOUT: u64 = 300_000;
+const NODE_TABLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, PartialEq, Eq)]
 /// Protocol info
@@ -104,10 +105,13 @@ pub struct NetworkContext<'s> {
 
 impl<'s> NetworkContext<'s> {
 	/// Create a new network IO access point. Takes references to all the data that can be updated within the IO handler.
-	fn new(io: &'s IoContext<NetworkIoMessage>,
+	fn new(
+		io: &'s IoContext<NetworkIoMessage>,
 		protocol: ProtocolId,
-		session: Option<SharedSession>, sessions: Arc<RwLock<Slab<SharedSession>>>,
-		reserved_peers: &'s HashSet<NodeId>) -> NetworkContext<'s> {
+		session: Option<SharedSession>,
+		sessions: Arc<RwLock<Slab<SharedSession>>>,
+		reserved_peers: &'s HashSet<NodeId>,
+	) -> NetworkContext<'s> {
 		let id = session.as_ref().map(|s| s.lock().token());
 		NetworkContext {
 			io: io,
@@ -165,10 +169,10 @@ impl<'s> NetworkContextTrait for NetworkContext<'s> {
 		self.session.as_ref().map_or(false, |s| s.lock().expired())
 	}
 
-	fn register_timer(&self, token: TimerToken, ms: u64) -> Result<(), Error> {
+	fn register_timer(&self, token: TimerToken, delay: Duration) -> Result<(), Error> {
 		self.io.message(NetworkIoMessage::AddTimer {
-			token: token,
-			delay: ms,
+			token,
+			delay,
 			protocol: self.protocol,
 		}).unwrap_or_else(|e| warn!("Error sending network IO message: {:?}", e));
 		Ok(())
@@ -584,10 +588,8 @@ impl Host {
 			let address = {
 				let mut nodes = self.nodes.write();
 				if let Some(node) = nodes.get_mut(id) {
-					node.attempts += 1;
 					node.endpoint.address
-				}
-				else {
+				} else {
 					debug!(target: "network", "Connection to expired node aborted");
 					return;
 				}
@@ -599,6 +601,7 @@ impl Host {
 				},
 				Err(e) => {
 					debug!(target: "network", "{}: Can't connect to address {:?}: {:?}", id, address, e);
+					self.nodes.write().note_failure(&id);
 					return;
 				}
 			}
@@ -684,10 +687,12 @@ impl Host {
 						Err(e) => {
 							let s = session.lock();
 							trace!(target: "network", "Session read error: {}:{:?} ({:?}) {:?}", token, s.id(), s.remote_addr(), e);
-							if let ErrorKind::Disconnect(DisconnectReason::IncompatibleProtocol) = *e.kind() {
+							if let ErrorKind::Disconnect(DisconnectReason::UselessPeer) = *e.kind() {
 								if let Some(id) = s.id() {
 									if !self.reserved_nodes.read().contains(id) {
-										self.nodes.write().mark_as_useless(id);
+										let mut nodes = self.nodes.write();
+										nodes.note_failure(&id);
+										nodes.mark_as_useless(id);
 									}
 								}
 							}
@@ -753,6 +758,10 @@ impl Host {
 									}
 								}
 							}
+
+							// Note connection success
+							self.nodes.write().note_success(&id);
+
 							for (p, _) in self.handlers.read().iter() {
 								if s.have_capability(*p) {
 									ready_data.push(*p);
@@ -1023,7 +1032,9 @@ impl IoHandler<NetworkIoMessage> for Host {
 				if let Some(session) = session {
 					session.lock().disconnect(io, DisconnectReason::DisconnectRequested);
 					if let Some(id) = session.lock().id() {
-						self.nodes.write().mark_as_useless(id)
+						let mut nodes = self.nodes.write();
+						nodes.note_failure(&id);
+						nodes.mark_as_useless(id);
 					}
 				}
 				trace!(target: "network", "Disabling peer {}", peer);

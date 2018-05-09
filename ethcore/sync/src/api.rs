@@ -17,6 +17,7 @@
 use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
 use std::io;
+use std::time::Duration;
 use bytes::Bytes;
 use devp2p::{NetworkService, ConnectionFilter};
 use network::{NetworkProtocolHandler, NetworkContext, HostInfo, PeerId, ProtocolId,
@@ -24,7 +25,7 @@ use network::{NetworkProtocolHandler, NetworkContext, HostInfo, PeerId, Protocol
 use ethereum_types::{H256, H512, U256};
 use io::{TimerToken};
 use ethcore::ethstore::ethkey::Secret;
-use ethcore::client::{BlockChainClient, ChainNotify, ChainMessageType};
+use ethcore::client::{BlockChainClient, ChainNotify, ChainRoute, ChainMessageType};
 use ethcore::snapshot::SnapshotService;
 use ethcore::header::BlockNumber;
 use sync_io::NetSyncIo;
@@ -39,6 +40,7 @@ use light::Provider;
 use light::net::{self as light_net, LightProtocol, Params as LightParams, Capabilities, Handler as LightHandler, EventContext};
 use network::IpFilter;
 use private_tx::PrivateTxHandler;
+use transaction::UnverifiedTransaction;
 
 /// Parity sync protocol
 pub const WARP_SYNC_PROTOCOL_ID: ProtocolId = *b"par";
@@ -316,7 +318,7 @@ impl EthSync {
 impl SyncProvider for EthSync {
 	/// Get sync status
 	fn status(&self) -> EthSyncStatus {
-		self.eth_handler.sync.write().status()
+		self.eth_handler.sync.read().status()
 	}
 
 	/// Get sync peers
@@ -372,7 +374,7 @@ struct SyncProtocolHandler {
 impl NetworkProtocolHandler for SyncProtocolHandler {
 	fn initialize(&self, io: &NetworkContext, _host_info: &HostInfo) {
 		if io.subprotocol_name() != WARP_SYNC_PROTOCOL_ID {
-			io.register_timer(0, 1000).expect("Error registering sync timer");
+			io.register_timer(0, Duration::from_secs(1)).expect("Error registering sync timer");
 		}
 	}
 
@@ -407,11 +409,10 @@ impl ChainNotify for EthSync {
 	fn new_blocks(&self,
 		imported: Vec<H256>,
 		invalid: Vec<H256>,
-		enacted: Vec<H256>,
-		retracted: Vec<H256>,
+		route: ChainRoute,
 		sealed: Vec<H256>,
 		proposed: Vec<Bytes>,
-		_duration: u64)
+		_duration: Duration)
 	{
 		use light::net::Announcement;
 
@@ -422,8 +423,8 @@ impl ChainNotify for EthSync {
 				&mut sync_io,
 				&imported,
 				&invalid,
-				&enacted,
-				&retracted,
+				route.enacted(),
+				route.retracted(),
 				&sealed,
 				&proposed);
 		});
@@ -450,7 +451,7 @@ impl ChainNotify for EthSync {
 
 	fn start(&self) {
 		match self.network.start().map_err(Into::into) {
-			Err(ErrorKind::Io(ref e)) if  e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
+			Err(ErrorKind::Io(ref e)) if e.kind() == io::ErrorKind::AddrInUse => warn!("Network port {:?} is already in use, make sure that another instance of an Ethereum client is not running or change the port using the --port option.", self.network.config().listen_address.expect("Listen address is not set.")),
 			Err(err) => warn!("Error starting network: {}", err),
 			_ => {},
 		}
@@ -486,9 +487,9 @@ impl ChainNotify for EthSync {
 		});
 	}
 
-	fn transactions_received(&self, hashes: Vec<H256>, peer_id: PeerId) {
+	fn transactions_received(&self, txs: &[UnverifiedTransaction], peer_id: PeerId) {
 		let mut sync = self.eth_handler.sync.write();
-		sync.transactions_received(hashes, peer_id);
+		sync.transactions_received(txs, peer_id);
 	}
 }
 
@@ -623,7 +624,7 @@ impl NetworkConfiguration {
 			config_path: self.config_path,
 			net_config_path: self.net_config_path,
 			listen_address: match self.listen_address { None => None, Some(addr) => Some(SocketAddr::from_str(&addr)?) },
-			public_address:  match self.public_address { None => None, Some(addr) => Some(SocketAddr::from_str(&addr)?) },
+			public_address: match self.public_address { None => None, Some(addr) => Some(SocketAddr::from_str(&addr)?) },
 			udp_port: self.udp_port,
 			nat_enabled: self.nat_enabled,
 			discovery_enabled: self.discovery_enabled,
